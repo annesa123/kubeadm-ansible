@@ -1,0 +1,205 @@
+---
+- name: Configure system for Kubernetes
+  hosts: all
+  become: yes
+  tasks:
+    # Enable IP forwarding
+    - name: Enable IPv4 forwarding via sysctl
+      copy:
+        dest: /etc/sysctl.d/99-kubernetes-cri.conf
+        content: |
+          net.ipv4.ip_forward = 1
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+      notify: reload sysctl
+
+    - name: Enable IPv4 forwarding immediately
+      command: echo 1 > /proc/sys/net/ipv4/ip_forward
+
+    # Disable swap
+    - name: Disable swap immediately
+      command: swapoff -a
+
+    - name: Disable swap in fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*?\sswap\sswap\s.*)$'
+        replace: '# \1'
+
+    # Install basic tools
+    - name: Clean apt cache
+      apt:
+        update_cache: no
+        clean: yes
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install basic packages
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+
+    # Install containerd
+    - name: Add Docker GPG key
+      get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: '0644'
+
+
+    - name: Get Ubuntu codename
+      ansible.builtin.shell: |
+        . /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}"
+      register: ubuntu_codename
+      changed_when: false
+
+    - name: Get system architecture
+      ansible.builtin.command: dpkg --print-architecture
+      register: system_arch
+      changed_when: false
+
+    - name: Add Docker repository
+      ansible.builtin.apt_repository:
+        repo: "deb [arch={{ system_arch.stdout }} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ubuntu_codename.stdout }} stable"
+        filename: docker
+        state: present
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+
+    - name: Install containerd
+      apt:
+        name: containerd.io
+        update_cache: yes
+        state: present
+
+    - name: Ensure containerd config directory exists
+      file:
+        path: /etc/containerd
+        state: directory
+
+    - name: Generate default containerd config
+      command: containerd config default
+      register: containerd_config
+      changed_when: false
+
+    - name: Save containerd config
+      copy:
+        dest: /etc/containerd/config.toml
+        content: "{{ containerd_config.stdout }}"
+
+    - name: Ensure containerd config exists
+      command: containerd config default > /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+
+    - name: Enable SystemdCgroup in containerd config
+      lineinfile:
+        path: /etc/containerd/config.toml
+        regexp: '^(\s*)SystemdCgroup\s*=\s*false'
+        line: '\1SystemdCgroup = true'
+        backrefs: yes
+        state: present
+
+    - name: Create containerd kernel modules config
+      copy:
+        dest: /etc/modules-load.d/containerd.conf
+        content: |
+          overlay
+          br_netfilter
+        owner: root
+        group: root
+        mode: 0644
+
+    - name: Load kernel modules
+      command: modprobe {{ item }}
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Restart containerd
+      systemd:
+        name: containerd
+        state: restarted
+
+    - name: Verify containerd is running
+      systemd:
+        name: containerd
+        state: started
+        enabled: yes
+
+
+    - name: Create keyring directory
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Remove duplicate Docker repository file
+      ansible.builtin.file:
+        path: /etc/apt/sources.list.d/docker.list.list
+        state: absent
+
+    # Download and install Kubernetes GPG key properly
+    - name: Download Kubernetes GPG key
+      ansible.builtin.get_url:
+        url: https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key
+        dest: /tmp/kubernetes-key.asc
+        mode: '0644'
+
+    - name: Convert and install Kubernetes GPG key
+      ansible.builtin.shell: |
+        gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg /tmp/kubernetes-key.asc
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Clean up temporary key
+      ansible.builtin.file:
+        path: /tmp/kubernetes-key.asc
+        state: absent
+
+    # Add Kubernetes repository with proper architecture specification
+    - name: Get system architecture
+      ansible.builtin.command: dpkg --print-architecture
+      register: system_arch
+      changed_when: false
+
+    - name: Add Kubernetes repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /"
+        filename: kubernetes
+        state: present
+
+    # Update apt cache with retries to handle transient network issues
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+      register: apt_update
+      until: apt_update is succeeded
+      retries: 3
+      delay: 5
+
+    - name: Install Kubernetes packages
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        update_cache: yes
+
+    - name: Hold Kubernetes packages
+      command: apt-mark hold kubelet kubeadm kubectl
+      changed_when: false
+
+  handlers:
+    - name: reload sysctl
+      command: sysctl --system
