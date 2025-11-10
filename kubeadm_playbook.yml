@@ -30,7 +30,7 @@
     - name: Clean apt cache
       apt:
         update_cache: no
-        clean: yes
+        autoclean: yes
 
     - name: Update apt cache
       apt:
